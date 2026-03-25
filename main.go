@@ -38,7 +38,7 @@ import (
 )
 
 /*
-AWS Manager (Go) - 全能网络版 (自动修复)
+AWS Manager (Go) - 全能网络版 (自动修复 + 支持新区域自动开通)
 - IPv6: 遇错直接修复，不询问
 - IPv4: 支持弹性 IP 管理
 */
@@ -328,7 +328,7 @@ func taskRunEC2(ctx context.Context, cfg aws.Config) {
 	ami := "ami-051f7e7f6c2f40dc1"
 	runOut, err := cli.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
-		InstanceType: ec2t.InstanceTypeT3Micro, // 修正为 t3.micro
+		InstanceType: ec2t.InstanceTypeT3Micro,
 		MinCount:     aws.Int32(1),
 		MaxCount:     aws.Int32(1),
 	})
@@ -583,30 +583,39 @@ func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]
 	return rs, nil
 }
 
+// 修复点 1：加强区域开通探测，必须等待 IAM 和新区域网络端点同步完成
 func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, creds aws.CredentialsProvider) error {
 	if currentStatus == "opt-in-not-required" || currentStatus == "opted-in" {
 		return nil
 	}
-	fmt.Printf("\n⚠️  检测到区域 %s 未启用\n", regionName)
-	if !yes(input("是否启用？[y/N]: ", "n")) {
-		return fmt.Errorf("取消")
+	fmt.Printf("\n⚠️  检测到区域 %s 未启用 (当前状态: %s)\n", regionName, currentStatus)
+	if !yes(input("是否发送启用请求并等待？(可能需要5-15分钟) [y/N]: ", "n")) {
+		return fmt.Errorf("已取消")
 	}
+
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
 	if err != nil {
 		return err
 	}
 	acctCli := account.NewFromConfig(cfg)
-	_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{RegionName: aws.String(regionName)})
-	if err != nil {
-		if !strings.Contains(err.Error(), "ResourceAlreadyExists") && !strings.Contains(err.Error(), "Region is enabled") {
-			return fmt.Errorf("失败: %v", err)
+
+	if currentStatus != "enabling" {
+		_, err = acctCli.EnableRegion(ctx, &account.EnableRegionInput{RegionName: aws.String(regionName)})
+		if err != nil {
+			if !strings.Contains(err.Error(), "ResourceAlreadyExists") && !strings.Contains(err.Error(), "Region is enabled") {
+				return fmt.Errorf("启用请求发送失败: %v", err)
+			}
 		}
+		fmt.Println("✅ 启用请求已发送")
 	}
-	fmt.Println("⏳ 请求已发送...")
+
 	ec2Cli := ec2.NewFromConfig(cfg)
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for {
+
+	fmt.Print("⏳ 等待区域状态变为 opted-in...")
+	optedIn := false
+	for i := 0; i < 40; i++ { // wait up to 10 mins
 		<-ticker.C
 		out, err := ec2Cli.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
 			RegionNames: []string{regionName},
@@ -618,13 +627,58 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 		}
 		if len(out.Regions) > 0 {
 			status := aws.ToString(out.Regions[0].OptInStatus)
-			fmt.Printf("[%s] ", status)
 			if status == "opted-in" {
-				fmt.Println("\n✅ 区域已成功启用！")
-				return nil
+				optedIn = true
+				fmt.Println("\n✅ 区域状态已更新为 opted-in！")
+				break
 			}
 		}
+		fmt.Print(".")
 	}
+
+	if !optedIn {
+		return fmt.Errorf("等待超时，区域仍在开通中，请稍后重新运行脚本。")
+	}
+
+	fmt.Print("⏳ 等待新区域的 API 权限完全同步 (IAM)...")
+	targetCfg, _ := mkCfg(ctx, regionName, creds)
+	targetEc2 := ec2.NewFromConfig(targetCfg)
+	ready := false
+	for i := 0; i < 40; i++ { // wait up to 10 mins
+		<-ticker.C
+		// 尝试调用新区域的 API，测试权限是否真正可用
+		_, err := targetEc2.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{})
+		if err == nil {
+			ready = true
+			fmt.Println("\n✅ 新区域 API 权限已完全就绪！")
+			break
+		} else if strings.Contains(err.Error(), "AuthFailure") || strings.Contains(err.Error(), "UnauthorizedOperation") {
+			fmt.Print("a") // Authentication failed (not fully synced)
+		} else if strings.Contains(err.Error(), "OptInRequired") {
+			fmt.Print("o") // Still requires opt-in logic to process
+		} else {
+			fmt.Print(".") // DNS or other spin-up lag
+		}
+	}
+	if !ready {
+		fmt.Println("\n⚠️ 区域 API 可能仍未完全就绪，将尝试继续，如果遇到报错请等几分钟后再试。")
+	}
+	return nil
+}
+
+// 修复点 2：为新开通的区域创建默认 VPC
+func ensureDefaultVpc(ctx context.Context, cli *ec2.Client) (string, error) {
+	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}}})
+	if err == nil && len(vpcs.Vpcs) > 0 {
+		return *vpcs.Vpcs[0].VpcId, nil
+	}
+	fmt.Println("⏳ 该区域尚未初始化网络，正在创建默认 VPC...")
+	out, err := cli.CreateDefaultVpc(ctx, &ec2.CreateDefaultVpcInput{})
+	if err != nil {
+		return "", fmt.Errorf("创建默认 VPC 失败: %v", err)
+	}
+	fmt.Println("✅ 默认 VPC 创建成功:", *out.Vpc.VpcId)
+	return *out.Vpc.VpcId, nil
 }
 
 func checkQuotas(ctx context.Context, creds aws.CredentialsProvider) {
@@ -696,7 +750,7 @@ VPC_READY:
 
 	subnet := subOut.Subnets[0]
 	subnetID := *subnet.SubnetId
-	
+
 	// 检查子网是否已有 IPv6
 	hasSubnetIPv6 := false
 	for _, assoc := range subnet.Ipv6CidrBlockAssociationSet {
@@ -725,7 +779,6 @@ VPC_READY:
 	// Route
 	rtOut, err := cli.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
 	if err == nil && len(rtOut.RouteTables) > 0 {
-		// 找到关联该子网的路由表，或者主路由表
 		var targetRT *ec2t.RouteTable
 		for _, rt := range rtOut.RouteTables {
 			for _, assoc := range rt.Associations {
@@ -771,22 +824,21 @@ VPC_READY:
 	return subnetID, nil
 }
 
-func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (string, string, error) {
-	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}}})
-	if err != nil || len(vpcs.Vpcs) == 0 {
-		return "", "", fmt.Errorf("无默认VPC")
+// 修改参数：直接传入 vpcID 避免重复查询
+func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, vpcID string) (string, error) {
+	if vpcID == "" {
+		return "", fmt.Errorf("VPC ID 不能为空")
 	}
-	vpcID := *vpcs.Vpcs[0].VpcId
 	sgName := "open-all-ports"
 	sgs, _ := cli.DescribeSecurityGroups(ctx, &ec2.DescribeSecurityGroupsInput{
 		Filters: []ec2t.Filter{{Name: aws.String("group-name"), Values: []string{sgName}}, {Name: aws.String("vpc-id"), Values: []string{vpcID}}},
 	})
 	if len(sgs.SecurityGroups) > 0 {
-		return *sgs.SecurityGroups[0].GroupId, vpcID, nil
+		return *sgs.SecurityGroups[0].GroupId, nil
 	}
 	res, err := cli.CreateSecurityGroup(ctx, &ec2.CreateSecurityGroupInput{GroupName: aws.String(sgName), Description: aws.String("Auto generated"), VpcId: aws.String(vpcID)})
 	if err != nil {
-		return "", vpcID, err
+		return "", err
 	}
 	cli.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: res.GroupId,
@@ -795,25 +847,10 @@ func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, region string) (strin
 			{IpProtocol: aws.String("-1"), Ipv6Ranges: []ec2t.Ipv6Range{{CidrIpv6: aws.String("::/0")}}},
 		},
 	})
-	return *res.GroupId, vpcID, nil
+	return *res.GroupId, nil
 }
 
-func getLatestAMI(ctx context.Context, cli *ec2.Client, owner, namePattern string) string {
-	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
-		Owners: []string{owner},
-		Filters: []ec2t.Filter{
-			{Name: aws.String("name"), Values: []string{namePattern}},
-			{Name: aws.String("architecture"), Values: []string{"x86_64"}},
-			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
-		},
-	})
-	if err != nil || len(out.Images) == 0 {
-		return ""
-	}
-	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
-	return *out.Images[0].ImageId
-}
-
+// 修复点 3：增加错误打印，防止被静默跳过
 func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePattern, arch string) string {
 	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		Owners: []string{owner},
@@ -823,7 +860,12 @@ func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePatte
 			{Name: aws.String("virtualization-type"), Values: []string{"hvm"}},
 		},
 	})
-	if err != nil || len(out.Images) == 0 {
+	if err != nil {
+		fmt.Printf("\n[错误] 查询 AMI 失败 (可能是新区域 API 尚未完全同步): %v\n", err)
+		return ""
+	}
+	if len(out.Images) == 0 {
+		fmt.Printf("\n[错误] 该区域未找到匹配的 AMI (Owner: %s)\n", owner)
 		return ""
 	}
 	sort.Slice(out.Images, func(i, j int) bool { return *out.Images[i].CreationDate > *out.Images[j].CreationDate })
@@ -851,6 +893,13 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	region := regionInfo.Name
 	cfg, _ := mkCfg(ctx, region, creds)
 	cli := ec2.NewFromConfig(cfg)
+
+	// 新区域必备：提前初始化默认 VPC 网络
+	vpcID, err := ensureDefaultVpc(ctx, cli)
+	if err != nil {
+		fmt.Println("❌ 初始化网络(VPC)失败:", err)
+		return
+	}
 
 	// AMI List
 	amiList := []AMIOption{
@@ -884,7 +933,7 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 		}
 	}
 	if ami == "" {
-		fmt.Println("❌ 未找到 AMI")
+		fmt.Println("❌ 未找到有效 AMI，终止创建")
 		return
 	}
 	fmt.Println("✅ 选中 AMI:", ami)
@@ -932,15 +981,14 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 		userData = rawUD
 	}
 
-	var sgID, vpcID string
+	var sgID string
 	if openAll || enableIPv6 {
-		s, v, err := ensureOpenAllSG(ctx, cli, region)
+		s, err := ensureOpenAllSG(ctx, cli, vpcID)
 		if err != nil {
-			fmt.Println("❌ 网络错误:", err)
+			fmt.Println("❌ 配置安全组失败:", err)
 			return
 		}
 		sgID = s
-		vpcID = v
 	}
 
 	var targetSubnetID string
@@ -960,10 +1008,11 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 		MinCount:     aws.Int32(count),
 		MaxCount:     aws.Int32(count),
 	}
-	// 这里使用了 base64
+	
 	if userData != "" {
 		runIn.UserData = aws.String(base64.StdEncoding.EncodeToString([]byte(userData)))
 	}
+	
 	if enableIPv6 || sgID != "" {
 		netIf := ec2t.InstanceNetworkInterfaceSpecification{DeviceIndex: aws.Int32(0), AssociatePublicIpAddress: aws.Bool(true)}
 		if sgID != "" {
@@ -972,6 +1021,12 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 		if enableIPv6 {
 			netIf.Ipv6AddressCount = aws.Int32(1)
 			netIf.SubnetId = aws.String(targetSubnetID)
+		} else {
+			// 如果没开 IPv6，但配置了安全组，也需要明确指定 VPC 默认的子网，否则可能会报错
+			subOut, err := cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
+			if err == nil && len(subOut.Subnets) > 0 {
+				netIf.SubnetId = subOut.Subnets[0].SubnetId
+			}
 		}
 		runIn.NetworkInterfaces = []ec2t.InstanceNetworkInterfaceSpecification{netIf}
 	}
@@ -1432,7 +1487,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 		netSel := input("选择: ", "0")
 
 		if netSel == "1" {
-			// ============ IPv6 Logic ============
 			fmt.Printf("当前 IPv6: %v\n", currentIPv6s)
 			fmt.Println(" 1) ➕ 分配新 IPv6")
 			fmt.Println(" 2) ➖ 删除现有 IPv6")
@@ -1443,7 +1497,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 					Ipv6AddressCount:   aws.Int32(1),
 				})
 				if err != nil {
-					// 自动修复逻辑：检查是否是网段缺失
 					if strings.Contains(err.Error(), "Subnet does not contain any IPv6 CIDR block ranges") {
 						fmt.Println("\n⚠️  检测到子网未配置 IPv6，正在自动修复 (VPC/子网/路由)...")
 						_, errFix := autoSetupIPv6(ctx, cli, sel.Region, vpcID, subnetID)
@@ -1492,7 +1545,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 				}
 			}
 		} else if netSel == "2" {
-			// ============ IPv4 EIP Logic ============
 			fmt.Println("\n--- 弹性公网 IP (Elastic IP) ---")
 			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
 				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
@@ -1524,7 +1576,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 						return
 					}
 				}
-				// 1. Allocate
 				fmt.Print("⏳ 正在申请 IP...")
 				allocOut, err := cli.AllocateAddress(ctx, &ec2.AllocateAddressInput{Domain: ec2t.DomainTypeVpc})
 				if err != nil {
@@ -1535,7 +1586,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 				allocID := *allocOut.AllocationId
 				fmt.Printf("成功! 获取到: %s\n", newIP)
 
-				// 2. Associate
 				fmt.Print("⏳ 正在绑定...")
 				_, err = cli.AssociateAddress(ctx, &ec2.AssociateAddressInput{
 					InstanceId: aws.String(sel.ID),
@@ -1554,11 +1604,9 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 					fmt.Println("❌ 当前没有绑定弹性 IP，无法释放。")
 					return
 				}
-				// 默认只处理第一个，如果需要更复杂可以做列表选择
 				target := eipOut.Addresses[0]
 				fmt.Printf("即将释放 IP: %s\n", *target.PublicIp)
 				if yes(input("确认解绑并释放? [y/N]: ", "n")) {
-					// 1. Disassociate
 					if target.AssociationId != nil {
 						_, err := cli.DisassociateAddress(ctx, &ec2.DisassociateAddressInput{
 							AssociationId: target.AssociationId,
@@ -1569,7 +1617,6 @@ func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProv
 						}
 						fmt.Println("✅ 已解绑")
 					}
-					// 2. Release
 					_, err := cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
 						AllocationId: target.AllocationId,
 					})
@@ -1591,7 +1638,6 @@ func main() {
 	ctx := context.Background()
 	fmt.Println("=== AWS 管理工具 (Win) ===")
 
-	// 代理选择菜单
 	fmt.Println("\n请选择连接方式:")
 	fmt.Println(" 1) 直连 (Direct Connection) [默认]")
 	fmt.Println(" 2) 代理 (Use Proxy)")
