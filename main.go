@@ -38,9 +38,7 @@ import (
 )
 
 /*
-AWS Manager (Go) - 全能网络版 (自动修复 + 支持新区域自动开通)
-- IPv6: 遇错直接修复，不询问
-- IPv4: 支持弹性 IP 管理
+AWS Manager (Go) - 全能网络版 (支持自定义公钥导入与绑定)
 */
 
 const bootstrapRegion = "us-east-1"
@@ -285,7 +283,7 @@ func printTable(header string, rowsFunc func(*tabwriter.Writer)) {
 	w.Flush()
 }
 
-// -------------------- 2. 自动化 $80 任务逻辑 --------------------
+// -------------------- 自动任务与抵扣金逻辑 --------------------
 
 func taskSetBudget(ctx context.Context, cfg aws.Config, acctID string) {
 	fmt.Println("\n[任务 1/4] 正在设置 AWS Cost Budget (成本预算)...")
@@ -325,7 +323,7 @@ func taskSetBudget(ctx context.Context, cfg aws.Config, acctID string) {
 func taskRunEC2(ctx context.Context, cfg aws.Config) {
 	fmt.Println("\n[任务 2/4] 正在启动 EC2 实例...")
 	cli := ec2.NewFromConfig(cfg)
-	ami := "ami-051f7e7f6c2f40dc1"
+	ami := "ami-051f7e7f6c2f40dc1" // us-east-1 fixed generic AMI
 	runOut, err := cli.RunInstances(ctx, &ec2.RunInstancesInput{
 		ImageId:      aws.String(ami),
 		InstanceType: ec2t.InstanceTypeT3Micro,
@@ -433,11 +431,11 @@ func taskRunRDS(ctx context.Context, cfg aws.Config) {
 	masterPass := "Password123456"
 	_, err := rdsCli.CreateDBInstance(ctx, &rds.CreateDBInstanceInput{
 		DBInstanceIdentifier:  aws.String(dbName),
-		DBInstanceClass:       aws.String("db.t3.micro"),
-		Engine:                aws.String("mysql"),
-		MasterUsername:        aws.String(masterUser),
-		MasterUserPassword:    aws.String(masterPass),
-		AllocatedStorage:      aws.Int32(20),
+		DBInstanceClass:        aws.String("db.t3.micro"),
+		Engine:                 aws.String("mysql"),
+		MasterUsername:         aws.String(masterUser),
+		MasterUserPassword:     aws.String(masterPass),
+		AllocatedStorage:       aws.Int32(20),
 		BackupRetentionPeriod: aws.Int32(0),
 	})
 	if err != nil {
@@ -540,7 +538,7 @@ func autoClaimCredits(ctx context.Context, creds aws.CredentialsProvider) {
 	}
 }
 
-// -------------------- 3. AWS 功能函数 (EC2, Lightsail) --------------------
+// -------------------- AWS EC2 功能逻辑 --------------------
 
 func getEC2RegionsWithStatus(ctx context.Context, creds aws.CredentialsProvider) ([]RegionInfo, error) {
 	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
@@ -562,28 +560,6 @@ func getEC2RegionsWithStatus(ctx context.Context, creds aws.CredentialsProvider)
 	return rs, nil
 }
 
-func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]string, error) {
-	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
-	if err != nil {
-		return nil, err
-	}
-	cli := lightsail.NewFromConfig(cfg)
-	out, err := cli.GetRegions(ctx, &lightsail.GetRegionsInput{})
-	if err != nil {
-		return nil, err
-	}
-	var rs []string
-	for _, r := range out.Regions {
-		name := string(r.Name)
-		if name != "" {
-			rs = append(rs, name)
-		}
-	}
-	sort.Strings(rs)
-	return rs, nil
-}
-
-// 修复点 1：加强区域开通探测，必须等待 IAM 和新区域网络端点同步完成
 func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, creds aws.CredentialsProvider) error {
 	if currentStatus == "opt-in-not-required" || currentStatus == "opted-in" {
 		return nil
@@ -615,11 +591,11 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 
 	fmt.Print("⏳ 等待区域状态变为 opted-in...")
 	optedIn := false
-	for i := 0; i < 40; i++ { // wait up to 10 mins
+	for i := 0; i < 40; i++ {
 		<-ticker.C
 		out, err := ec2Cli.DescribeRegions(ctx, &ec2.DescribeRegionsInput{
 			RegionNames: []string{regionName},
-			AllRegions:  aws.Bool(true),
+			AllRegions:   aws.Bool(true),
 		})
 		if err != nil {
 			fmt.Print("x")
@@ -644,20 +620,19 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 	targetCfg, _ := mkCfg(ctx, regionName, creds)
 	targetEc2 := ec2.NewFromConfig(targetCfg)
 	ready := false
-	for i := 0; i < 40; i++ { // wait up to 10 mins
+	for i := 0; i < 40; i++ {
 		<-ticker.C
-		// 尝试调用新区域的 API，测试权限是否真正可用
 		_, err := targetEc2.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{})
 		if err == nil {
 			ready = true
 			fmt.Println("\n✅ 新区域 API 权限已完全就绪！")
 			break
 		} else if strings.Contains(err.Error(), "AuthFailure") || strings.Contains(err.Error(), "UnauthorizedOperation") {
-			fmt.Print("a") // Authentication failed (not fully synced)
+			fmt.Print("a")
 		} else if strings.Contains(err.Error(), "OptInRequired") {
-			fmt.Print("o") // Still requires opt-in logic to process
+			fmt.Print("o")
 		} else {
-			fmt.Print(".") // DNS or other spin-up lag
+			fmt.Print(".")
 		}
 	}
 	if !ready {
@@ -666,7 +641,6 @@ func ensureRegionOptIn(ctx context.Context, regionName, currentStatus string, cr
 	return nil
 }
 
-// 修复点 2：为新开通的区域创建默认 VPC
 func ensureDefaultVpc(ctx context.Context, cli *ec2.Client) (string, error) {
 	vpcs, err := cli.DescribeVpcs(ctx, &ec2.DescribeVpcsInput{Filters: []ec2t.Filter{{Name: aws.String("isDefault"), Values: []string{"true"}}}})
 	if err == nil && len(vpcs.Vpcs) > 0 {
@@ -736,7 +710,6 @@ func autoSetupIPv6(ctx context.Context, cli *ec2.Client, region, vpcID, targetSu
 		return "", fmt.Errorf("超时")
 	}
 VPC_READY:
-	// 获取子网
 	var subOut *ec2.DescribeSubnetsOutput
 	if targetSubnetID != "" {
 		subOut, err = cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{SubnetIds: []string{targetSubnetID}})
@@ -751,7 +724,6 @@ VPC_READY:
 	subnet := subOut.Subnets[0]
 	subnetID := *subnet.SubnetId
 
-	// 检查子网是否已有 IPv6
 	hasSubnetIPv6 := false
 	for _, assoc := range subnet.Ipv6CidrBlockAssociationSet {
 		if assoc.Ipv6CidrBlockState.State == ec2t.SubnetCidrBlockStateCodeAssociated {
@@ -776,7 +748,6 @@ VPC_READY:
 		SubnetId: aws.String(subnetID), AssignIpv6AddressOnCreation: &ec2t.AttributeBooleanValue{Value: aws.Bool(true)},
 	})
 
-	// Route
 	rtOut, err := cli.DescribeRouteTables(ctx, &ec2.DescribeRouteTablesInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
 	if err == nil && len(rtOut.RouteTables) > 0 {
 		var targetRT *ec2t.RouteTable
@@ -824,7 +795,6 @@ VPC_READY:
 	return subnetID, nil
 }
 
-// 修改参数：直接传入 vpcID 避免重复查询
 func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, vpcID string) (string, error) {
 	if vpcID == "" {
 		return "", fmt.Errorf("VPC ID 不能为空")
@@ -850,7 +820,6 @@ func ensureOpenAllSG(ctx context.Context, cli *ec2.Client, vpcID string) (string
 	return *res.GroupId, nil
 }
 
-// 修复点 3：增加错误打印，防止被静默跳过
 func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePattern, arch string) string {
 	out, err := cli.DescribeImages(ctx, &ec2.DescribeImagesInput{
 		Owners: []string{owner},
@@ -861,7 +830,7 @@ func getLatestAMIWithArch(ctx context.Context, cli *ec2.Client, owner, namePatte
 		},
 	})
 	if err != nil {
-		fmt.Printf("\n[错误] 查询 AMI 失败 (可能是新区域 API 尚未完全同步): %v\n", err)
+		fmt.Printf("\n[错误] 查询 AMI 失败: %v\n", err)
 		return ""
 	}
 	if len(out.Images) == 0 {
@@ -894,14 +863,12 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	cfg, _ := mkCfg(ctx, region, creds)
 	cli := ec2.NewFromConfig(cfg)
 
-	// 新区域必备：提前初始化默认 VPC 网络
 	vpcID, err := ensureDefaultVpc(ctx, cli)
 	if err != nil {
 		fmt.Println("❌ 初始化网络(VPC)失败:", err)
 		return
 	}
 
-	// AMI List
 	amiList := []AMIOption{
 		{"Debian 12", "136693071363", "debian-12-*"},
 		{"Debian 11", "136693071363", "debian-11-*"},
@@ -938,7 +905,6 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	}
 	fmt.Println("✅ 选中 AMI:", ami)
 
-	// Type
 	var typeList []TypeOption
 	if targetArch == "x86_64" {
 		typeList = []TypeOption{{"t2.nano", "1 vCPU, 0.5 GiB"}, {"t2.micro", "1 vCPU, 1.0 GiB"}, {"t3.micro", "2 vCPU, 1.0 GiB"}}
@@ -1022,7 +988,6 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 			netIf.Ipv6AddressCount = aws.Int32(1)
 			netIf.SubnetId = aws.String(targetSubnetID)
 		} else {
-			// 如果没开 IPv6，但配置了安全组，也需要明确指定 VPC 默认的子网，否则可能会报错
 			subOut, err := cli.DescribeSubnets(ctx, &ec2.DescribeSubnetsInput{Filters: []ec2t.Filter{{Name: aws.String("vpc-id"), Values: []string{vpcID}}}})
 			if err == nil && len(subOut.Subnets) > 0 {
 				netIf.SubnetId = subOut.Subnets[0].SubnetId
@@ -1049,6 +1014,338 @@ func ec2Create(ctx context.Context, regions []RegionInfo, creds aws.CredentialsP
 	for _, ins := range out.Instances {
 		fmt.Println("✅ 成功:", *ins.InstanceId)
 	}
+}
+
+func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]EC2InstanceRow, error) {
+	var mu sync.Mutex
+	var rows []EC2InstanceRow
+	var wg sync.WaitGroup
+	fmt.Printf("正在并发扫描 %d 个 EC2 区域...\n", len(regions))
+	for _, rg := range regions {
+		wg.Add(1)
+		go func(region string) {
+			defer wg.Done()
+			cfg, err := mkCfg(ctx, region, creds)
+			if err != nil {
+				return
+			}
+			cli := ec2.NewFromConfig(cfg)
+			out, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
+			if err != nil {
+				return
+			}
+			var local []EC2InstanceRow
+			for _, res := range out.Reservations {
+				for _, ins := range res.Instances {
+					if ins.State.Name == ec2t.InstanceStateNameTerminated {
+						continue
+					}
+					name := ""
+					for _, t := range ins.Tags {
+						if *t.Key == "Name" {
+							name = *t.Value
+						}
+					}
+					pub := ""
+					if ins.PublicIpAddress != nil {
+						pub = *ins.PublicIpAddress
+					}
+					priv := ""
+					if ins.PrivateIpAddress != nil {
+						priv = *ins.PrivateIpAddress
+					}
+					ipv6 := ""
+					if len(ins.NetworkInterfaces) > 0 && len(ins.NetworkInterfaces[0].Ipv6Addresses) > 0 {
+						ipv6 = *ins.NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address
+					}
+					local = append(local, EC2InstanceRow{
+						Region: region, ID: *ins.InstanceId, State: string(ins.State.Name),
+						Name: name, Type: string(ins.InstanceType), PubIP: pub, PrivIP: priv, IPv6: ipv6,
+					})
+				}
+			}
+			mu.Lock()
+			rows = append(rows, local...)
+			mu.Unlock()
+		}(rg)
+	}
+	wg.Wait()
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Region < rows[j].Region })
+	for i := range rows {
+		rows[i].Idx = i + 1
+	}
+	return rows, nil
+}
+
+func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
+	rows, _ := ec2ListAll(ctx, regions, creds)
+	if len(rows) == 0 {
+		fmt.Println("❌ 无实例")
+		return
+	}
+	printTable("序号\t区域\tID\t名称\t状态\t配置\t公网IP\t内网IP\tIPv6", func(w *tabwriter.Writer) {
+		for _, r := range rows {
+			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				r.Idx, r.Region, r.ID, cut(r.Name, 10), r.State, r.Type, r.PubIP, r.PrivIP, r.IPv6)
+		}
+	})
+	idx := mustInt(input("\n输入序号操作 (0 返回): ", "0"))
+	if idx <= 0 || idx > len(rows) {
+		return
+	}
+	sel := rows[idx-1]
+	cfg, _ := mkCfg(ctx, sel.Region, creds)
+	cli := ec2.NewFromConfig(cfg)
+	fmt.Printf("\n🔍 正在获取实例 %s 的详细指标...\n", sel.ID)
+	desc, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
+	
+	var eniID string
+	var currentIPv6s []string
+	var vpcID, subnetID string
+
+	if err == nil && len(desc.Reservations) > 0 {
+		ins := desc.Reservations[0].Instances[0]
+		vpcID = *ins.VpcId
+		subnetID = *ins.SubnetId
+
+		var diskInfo []string
+		for _, bd := range ins.BlockDeviceMappings {
+			if bd.Ebs != nil {
+				volID := *bd.Ebs.VolumeId
+				vOut, err := cli.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{VolumeIds: []string{volID}})
+				if err == nil && len(vOut.Volumes) > 0 {
+					diskInfo = append(diskInfo, fmt.Sprintf("%s [%d GB %s]", *bd.DeviceName, *vOut.Volumes[0].Size, vOut.Volumes[0].VolumeType))
+				}
+			}
+		}
+
+		if len(ins.NetworkInterfaces) > 0 {
+			eniID = *ins.NetworkInterfaces[0].NetworkInterfaceId
+			for _, addr := range ins.NetworkInterfaces[0].Ipv6Addresses {
+				currentIPv6s = append(currentIPv6s, *addr.Ipv6Address)
+			}
+		}
+
+		fmt.Println("================================================================")
+		fmt.Printf(" 实例 ID   : %s\n", *ins.InstanceId)
+		fmt.Printf(" 所在区域  : %s (%s)\n", sel.Region, *ins.Placement.AvailabilityZone)
+		fmt.Printf(" 实例类型  : %s\n", ins.InstanceType)
+		fmt.Printf(" 运行状态  : %s\n", ins.State.Name)
+		fmt.Printf(" 公网 IPv4 : %s\n", sel.PubIP)
+		fmt.Printf(" 内网 IPv4 : %s\n", sel.PrivIP)
+		if len(currentIPv6s) > 0 {
+			fmt.Printf(" IPv6 地址 : %s\n", strings.Join(currentIPv6s, ", "))
+		} else {
+			fmt.Printf(" IPv6 地址 : (未分配)\n")
+		}
+		fmt.Printf(" 启动时间  : %s\n", ins.LaunchTime.Format("2006-01-02 15:04:05"))
+		if ins.KeyName != nil {
+			fmt.Printf(" SSH 密钥  : %s\n", *ins.KeyName)
+		}
+		fmt.Printf(" 磁盘挂载  : %s\n", strings.Join(diskInfo, ", "))
+		fmt.Println("================================================================")
+	}
+
+	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 终止 5) 🔧 网络管理 (IP)\n", sel.ID)
+	switch input("选择: ", "0") {
+	case "1":
+		cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
+		fmt.Println("✅ 启动中")
+	case "2":
+		cli.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{sel.ID}})
+		fmt.Println("✅ 停止中")
+	case "3":
+		cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
+		fmt.Println("✅ 重启中")
+	case "4":
+		if yes(input("⚠️ 确认终止实例 (删除)? [y/N]: ", "n")) {
+			fmt.Println("🔍 检查关联EIP...")
+			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
+			})
+			if err == nil && len(eipOut.Addresses) > 0 {
+				for _, addr := range eipOut.Addresses {
+					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: addr.AllocationId})
+					fmt.Printf("   ✅ 已释放 IP: %s\n", *addr.PublicIp)
+				}
+			}
+			cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
+			fmt.Println("🗑️ 正在终止...")
+		}
+	case "5":
+		if eniID == "" {
+			fmt.Println("❌ 无法找到网络接口 (ENI)，无法操作")
+			return
+		}
+		fmt.Println("\n--- 网络/IP 管理 ---")
+		fmt.Println(" 1) IPv6 管理 (分配/删除)")
+		fmt.Println(" 2) IPv4 公网/弹性IP 管理 (绑定/释放)")
+		netSel := input("选择: ", "0")
+
+		if netSel == "1" {
+			fmt.Printf("当前 IPv6: %v\n", currentIPv6s)
+			fmt.Println(" 1) ➕ 分配新 IPv6")
+			fmt.Println(" 2) ➖ 删除现有 IPv6")
+			sub := input("选择: ", "0")
+			if sub == "1" {
+				_, err := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
+					NetworkInterfaceId: aws.String(eniID),
+					Ipv6AddressCount:   aws.Int32(1),
+				})
+				if err != nil {
+					if strings.Contains(err.Error(), "Subnet does not contain any IPv6 CIDR block ranges") {
+						fmt.Println("\n⚠️  检测到子网未配置 IPv6，正在自动修复 (VPC/子网/路由)...")
+						_, errFix := autoSetupIPv6(ctx, cli, sel.Region, vpcID, subnetID)
+						if errFix != nil {
+							fmt.Printf("❌ 修复失败: %v\n", errFix)
+						} else {
+							fmt.Println("✅ 网络配置已修复，正在重试分配 IP...")
+							time.Sleep(2 * time.Second)
+							_, errRetry := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
+								NetworkInterfaceId: aws.String(eniID),
+								Ipv6AddressCount:   aws.Int32(1),
+							})
+							if errRetry != nil {
+								fmt.Printf("❌ 重试分配失败: %v\n", errRetry)
+							} else {
+								fmt.Println("✅ 分配成功！")
+							}
+						}
+					} else {
+						fmt.Printf("❌ 分配失败: %v\n", err)
+					}
+				} else {
+					fmt.Println("✅ 分配成功！")
+				}
+			} else if sub == "2" {
+				if len(currentIPv6s) == 0 {
+					fmt.Println("❌ 当前没有 IPv6 地址可删除")
+					return
+				}
+				fmt.Println("请选择要删除的 IP:")
+				for i, ip := range currentIPv6s {
+					fmt.Printf(" %d) %s\n", i+1, ip)
+				}
+				delIdx := mustInt(input("编号: ", "0"))
+				if delIdx > 0 && delIdx <= len(currentIPv6s) {
+					targetIP := currentIPv6s[delIdx-1]
+					_, err := cli.UnassignIpv6Addresses(ctx, &ec2.UnassignIpv6AddressesInput{
+						NetworkInterfaceId: aws.String(eniID),
+						Ipv6Addresses:      []string{targetIP},
+					})
+					if err != nil {
+						fmt.Printf("❌ 删除失败: %v\n", err)
+					} else {
+						fmt.Printf("✅ 已删除: %s\n", targetIP)
+					}
+				}
+			}
+		} else if netSel == "2" {
+			fmt.Println("\n--- 弹性公网 IP (Elastic IP) ---")
+			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
+				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
+			})
+			if err != nil {
+				fmt.Println("❌ 查询失败:", err)
+				return
+			}
+			
+			hasEIP := len(eipOut.Addresses) > 0
+			fmt.Printf("当前公网 IP: %s\n", sel.PubIP)
+			if hasEIP {
+				fmt.Println("状态: [✅ 已绑定弹性 IP]")
+				for _, addr := range eipOut.Addresses {
+					fmt.Printf(" - %s (AllocationId: %s)\n", *addr.PublicIp, *addr.AllocationId)
+				}
+			} else {
+				fmt.Println("状态: [⚠️ 动态公网 IP]")
+			}
+
+			fmt.Println("\n 1) ➕ 申请并绑定新 EIP (收费/Static)")
+			fmt.Println(" 2) ➖ 解绑并释放 EIP (省费)")
+			
+			sub := input("选择: ", "0")
+			if sub == "1" {
+				if hasEIP {
+					fmt.Println("⚠️ 提示: 该实例已经绑定了弹性 IP。")
+					if !yes(input("继续申请吗? [y/N]: ", "n")) {
+						return
+					}
+				}
+				fmt.Print("⏳ 正在申请 IP...")
+				allocOut, err := cli.AllocateAddress(ctx, &ec2.AllocateAddressInput{Domain: ec2t.DomainTypeVpc})
+				if err != nil {
+					fmt.Println("\n❌ 申请失败:", err)
+					return
+				}
+				newIP := *allocOut.PublicIp
+				allocID := *allocOut.AllocationId
+				fmt.Printf("成功! 获取到: %s\n", newIP)
+
+				fmt.Print("⏳ 正在绑定...")
+				_, err = cli.AssociateAddress(ctx, &ec2.AssociateAddressInput{
+					InstanceId: aws.String(sel.ID),
+					AllocationId: aws.String(allocID),
+				})
+				if err != nil {
+					fmt.Printf("\n❌ 绑定失败: %v\n", err)
+					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: aws.String(allocID)})
+				} else {
+					fmt.Println("\n✅ 绑定成功！")
+				}
+			} else if sub == "2" {
+				if !hasEIP {
+					fmt.Println("❌ 当前没有绑定弹性 IP，无法释放。")
+					return
+				}
+				target := eipOut.Addresses[0]
+				fmt.Printf("即将释放 IP: %s\n", *target.PublicIp)
+				if yes(input("确认解绑并释放? [y/N]: ", "n")) {
+					if target.AssociationId != nil {
+						_, err := cli.DisassociateAddress(ctx, &ec2.DisassociateAddressInput{
+							AssociationId: target.AssociationId,
+						})
+						if err != nil {
+							fmt.Println("❌ 解绑失败:", err)
+							return
+						}
+						fmt.Println("✅ 已解绑")
+					}
+					_, err := cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
+						AllocationId: target.AllocationId,
+					})
+					if err != nil {
+						fmt.Println("❌ 释放失败:", err)
+					} else {
+						fmt.Println("✅ 已释放 (停止计费)")
+					}
+				}
+			}
+		}
+	}
+}
+
+// -------------------- AWS Lightsail 功能逻辑 --------------------
+
+func getLightsailRegions(ctx context.Context, creds aws.CredentialsProvider) ([]string, error) {
+	cfg, err := mkCfg(ctx, bootstrapRegion, creds)
+	if err != nil {
+		return nil, err
+	}
+	cli := lightsail.NewFromConfig(cfg)
+	out, err := cli.GetRegions(ctx, &lightsail.GetRegionsInput{})
+	if err != nil {
+		return nil, err
+	}
+	var rs []string
+	for _, r := range out.Regions {
+		name := string(r.Name)
+		if name != "" {
+			rs = append(rs, name)
+		}
+	}
+	sort.Strings(rs)
+	return rs, nil
 }
 
 func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]LSInstanceRow, error) {
@@ -1110,6 +1407,37 @@ func lsListAll(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	return rows, nil
 }
 
+func checkLSKeyPairExists(ctx context.Context, client *lightsail.Client, keyPairName string) (bool, error) {
+	out, err := client.GetKeyPairs(ctx, &lightsail.GetKeyPairsInput{})
+	if err != nil {
+		return false, err
+	}
+	for _, kp := range out.KeyPairs {
+		if kp.Name != nil && *kp.Name == keyPairName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func importLSKeyPair(ctx context.Context, client *lightsail.Client, keyPairName, publicKeyPath string) error {
+	publicKeyBytes, err := os.ReadFile(publicKeyPath)
+	if err != nil {
+		return fmt.Errorf("读取本地公钥文件失败 (%s): %w", publicKeyPath, err)
+	}
+	publicKey := string(publicKeyBytes)
+
+	_, err = client.ImportKeyPair(ctx, &lightsail.ImportKeyPairInput{
+		KeyPairName:     &keyPairName,
+		PublicKeyBase64: &publicKey,
+	})
+	if err != nil {
+		return fmt.Errorf("调用 AWS 导入密钥对 API 失败: %w", err)
+	}
+	fmt.Printf("  ✓ 成功向该区域导入公钥密钥对: %s\n", keyPairName)
+	return nil
+}
+
 func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
 	region, err := pickFromList("\n选择 Lightsail Region：", regions, "us-east-1")
 	if err != nil {
@@ -1117,8 +1445,39 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	}
 	cfg, _ := mkCfg(ctx, region, creds)
 	cli := lightsail.NewFromConfig(cfg)
-	az := input("可用区 (默认自动): ", region+"a")
+	
+	az := input(fmt.Sprintf("可用区 (默认 %sa): ", region), region+"a")
 	name := input("实例名称 [LS-1]: ", "LS-1")
+
+	var finalKeyPairName *string
+	fmt.Println("\n--- SSH 密钥对配置 ---")
+	fmt.Println(" 1) 使用 AWS 默认密钥对 (或创建时不绑定自定义密钥)")
+	fmt.Println(" 2) 自动导入并绑定本地自定义公钥 (推荐)")
+	keySel := input("请选择密钥模式 [2]: ", "2")
+
+	if keySel == "2" {
+		kpName := input("请输入保存在 AWS 的密钥对名称 [my-custom-key]: ", "my-custom-key")
+		defaultKeyPath := os.ExpandEnv("$HOME/.ssh/id_rsa.pub")
+		kpPath := input(fmt.Sprintf("请输入本地公钥绝对路径 [%s]: ", defaultKeyPath), defaultKeyPath)
+
+		fmt.Printf("🔍 正在检查区域 %s 中是否存在密钥对 '%s'...\n", region, kpName)
+		exists, err := checkLSKeyPairExists(ctx, cli, kpName)
+		if err != nil {
+			fmt.Printf(" ⚠️ 无法检查密钥对状态 (%v)，尝试直接推进...\n", err)
+		}
+		
+		if !exists {
+			fmt.Printf(" ⏳ 密钥对不存在，正在从本地 %s 导入...\n", kpPath)
+			if err := importLSKeyPair(ctx, cli, kpName, kpPath); err != nil {
+				fmt.Printf(" ❌ 导入自定义公钥失败: %v。将终止创建流。\n", err)
+				return
+			}
+		} else {
+			fmt.Printf("  ✓ 密钥对 '%s' 已经在该区域准备就绪\n", kpName)
+		}
+		finalKeyPairName = aws.String(kpName)
+	}
+
 	bOut, _ := cli.GetBundles(ctx, &lightsail.GetBundlesInput{})
 	type bRow struct {
 		ID    string
@@ -1145,7 +1504,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 			break
 		}
 	}
-	fmt.Println("--- 套餐列表 ---")
+	fmt.Println("\n--- 套餐列表 ---")
 	printTable("NO.\tID\tPrice\tRAM\tCPU", func(w *tabwriter.Writer) {
 		for i, b := range brs {
 			mk := ""; if i+1 == defIdx { mk = " <-- 默认" }
@@ -1157,6 +1516,7 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	if idx, err := strconv.Atoi(bIn); err == nil && idx > 0 && idx <= len(brs) {
 		finalBundle = brs[idx-1].ID
 	}
+
 	pOut, _ := cli.GetBlueprints(ctx, &lightsail.GetBlueprintsInput{})
 	var osList []string
 	defOSIdx := 1
@@ -1167,29 +1527,46 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 	}
 	sort.Strings(osList)
 	fmt.Println("\n--- 系统列表 ---")
-	for i, os := range osList {
-		mk := ""; if os == "debian_12" { mk = " <-- 默认"; defOSIdx = i + 1 }
-		fmt.Printf("[%d] %s%s\n", i+1, os, mk)
+	for i, osName := range osList {
+		mk := ""; if osName == "debian_12" { mk = " <-- 默认"; defOSIdx = i + 1 }
+		fmt.Printf("[%d] %s%s\n", i+1, osName, mk)
 	}
 	oIn := input(fmt.Sprintf("输入系统序号 (默认 %d): ", defOSIdx), "")
 	finalOS := osList[defOSIdx-1]
 	if idx, err := strconv.Atoi(oIn); err == nil && idx > 0 && idx <= len(osList) {
 		finalOS = osList[idx-1]
 	}
-	openAll := yes(input("是否全开防火墙端口 (TCP+UDP 0-65535)? [y/N]: ", "n"))
+
+	openAll := yes(input("\n是否全开防火墙端口 (TCP+UDP 0-65535)? [y/N]: ", "n"))
 	ud, _ := collectUserData("\n可选：UserData 脚本")
-	fmt.Println("🚀 创建中...")
-	_, err = cli.CreateInstances(ctx, &lightsail.CreateInstancesInput{
-		AvailabilityZone: aws.String(az), BlueprintId: aws.String(finalOS), BundleId: aws.String(finalBundle),
-		InstanceNames: []string{name}, UserData: aws.String(ud),
-	})
+
+	fmt.Println("\n🚀 正在提交 Lightsail 创建请求...")
+	createInput := &lightsail.CreateInstancesInput{
+		AvailabilityZone: aws.String(az),
+		BlueprintId:      aws.String(finalOS),
+		BundleId:         aws.String(finalBundle),
+		InstanceNames:    []string{name},
+	}
+	if ud != "" {
+		createInput.UserData = aws.String(ud)
+	}
+	if finalKeyPairName != nil {
+		createInput.KeyPairName = finalKeyPairName
+	}
+
+	res, err := cli.CreateInstances(ctx, createInput)
 	if err != nil {
-		fmt.Println("❌ 失败:", err)
+		fmt.Println("❌ 建立 Lightsail 实例失败:", err)
 		return
 	}
-	fmt.Println("✅ 实例创建指令已提交")
+	
+	fmt.Println("✅ 实例指令提交成功。操作历史:")
+	for _, op := range res.Operations {
+		fmt.Printf("  - [%s] 状态: %v\n", op.OperationType, op.Status)
+	}
+
 	if openAll {
-		fmt.Println("⏳ 正在等待实例就绪以配置防火墙 (最多等待 60 秒)...")
+		fmt.Println("⏳ 正在等待实例进入 running 状态以配置防火墙安全策略 (最多等待 60 秒)...")
 		ready := false
 		for i := 0; i < 30; i++ {
 			time.Sleep(2 * time.Second)
@@ -1203,17 +1580,21 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 			fmt.Print(".")
 		}
 		if ready {
-			fmt.Println("\n✅ 实例已就绪，正在开启端口...")
-			cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
+			fmt.Println("\n✅ 实例就绪，正在投递防火墙全通网卡规则...")
+			_, err = cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
 				InstanceName: aws.String(name),
 				PortInfos: []lst.PortInfo{
 					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolTcp},
 					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolUdp},
 				},
 			})
-			fmt.Println("✅ 防火墙规则已更新 (全开)")
+			if err != nil {
+				fmt.Printf("❌ 放行端口失败: %v\n", err)
+			} else {
+				fmt.Println("✅ 规则应用成功 (TCP+UDP 0-65535 全放行)")
+			}
 		} else {
-			fmt.Println("\n⚠️ 等待超时，请稍后手动配置防火墙。")
+			fmt.Println("\n⚠️ 实例启动超时，安全组注入未执行，请稍后前往控制台手动修改。")
 		}
 	}
 }
@@ -1318,319 +1699,6 @@ func lsControl(ctx context.Context, regions []string, creds aws.CredentialsProvi
 	}
 }
 
-func ec2ListAll(ctx context.Context, regions []string, creds aws.CredentialsProvider) ([]EC2InstanceRow, error) {
-	var mu sync.Mutex
-	var rows []EC2InstanceRow
-	var wg sync.WaitGroup
-	fmt.Printf("正在并发扫描 %d 个 EC2 区域...\n", len(regions))
-	for _, rg := range regions {
-		wg.Add(1)
-		go func(region string) {
-			defer wg.Done()
-			cfg, err := mkCfg(ctx, region, creds)
-			if err != nil {
-				return
-			}
-			cli := ec2.NewFromConfig(cfg)
-			out, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{})
-			if err != nil {
-				return
-			}
-			var local []EC2InstanceRow
-			for _, res := range out.Reservations {
-				for _, ins := range res.Instances {
-					if ins.State.Name == ec2t.InstanceStateNameTerminated {
-						continue
-					}
-					name := ""
-					for _, t := range ins.Tags {
-						if *t.Key == "Name" {
-							name = *t.Value
-						}
-					}
-					pub := ""
-					if ins.PublicIpAddress != nil {
-						pub = *ins.PublicIpAddress
-					}
-					priv := ""
-					if ins.PrivateIpAddress != nil {
-						priv = *ins.PrivateIpAddress
-					}
-					ipv6 := ""
-					if len(ins.NetworkInterfaces) > 0 && len(ins.NetworkInterfaces[0].Ipv6Addresses) > 0 {
-						ipv6 = *ins.NetworkInterfaces[0].Ipv6Addresses[0].Ipv6Address
-					}
-					local = append(local, EC2InstanceRow{
-						Region: region, ID: *ins.InstanceId, State: string(ins.State.Name),
-						Name: name, Type: string(ins.InstanceType), PubIP: pub, PrivIP: priv, IPv6: ipv6,
-					})
-				}
-			}
-			mu.Lock()
-			rows = append(rows, local...)
-			mu.Unlock()
-		}(rg)
-	}
-	wg.Wait()
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Region < rows[j].Region })
-	for i := range rows {
-		rows[i].Idx = i + 1
-	}
-	return rows, nil
-}
-
-func ec2Control(ctx context.Context, regions []string, creds aws.CredentialsProvider) {
-	rows, _ := ec2ListAll(ctx, regions, creds)
-	if len(rows) == 0 {
-		fmt.Println("❌ 无实例")
-		return
-	}
-	printTable("序号\t区域\tID\t名称\t状态\t配置\t公网IP\t内网IP\tIPv6", func(w *tabwriter.Writer) {
-		for _, r := range rows {
-			fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				r.Idx, r.Region, r.ID, cut(r.Name, 10), r.State, r.Type, r.PubIP, r.PrivIP, r.IPv6)
-		}
-	})
-	idx := mustInt(input("\n输入序号操作 (0 返回): ", "0"))
-	if idx <= 0 || idx > len(rows) {
-		return
-	}
-	sel := rows[idx-1]
-	cfg, _ := mkCfg(ctx, sel.Region, creds)
-	cli := ec2.NewFromConfig(cfg)
-	fmt.Printf("\n🔍 正在获取实例 %s 的详细指标 (磁盘/网络/密钥)...\n", sel.ID)
-	desc, err := cli.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: []string{sel.ID}})
-	
-	// 用于保存主网卡ID和当前IPv6列表，供后续操作使用
-	var eniID string
-	var currentIPv6s []string
-	var vpcID, subnetID string
-
-	if err == nil && len(desc.Reservations) > 0 {
-		ins := desc.Reservations[0].Instances[0]
-		vpcID = *ins.VpcId
-		subnetID = *ins.SubnetId
-
-		var diskInfo []string
-		for _, bd := range ins.BlockDeviceMappings {
-			if bd.Ebs != nil {
-				volID := *bd.Ebs.VolumeId
-				vOut, err := cli.DescribeVolumes(ctx, &ec2.DescribeVolumesInput{VolumeIds: []string{volID}})
-				if err == nil && len(vOut.Volumes) > 0 {
-					diskInfo = append(diskInfo, fmt.Sprintf("%s [%d GB %s]", *bd.DeviceName, *vOut.Volumes[0].Size, vOut.Volumes[0].VolumeType))
-				}
-			}
-		}
-
-		// 获取主网卡信息
-		if len(ins.NetworkInterfaces) > 0 {
-			eniID = *ins.NetworkInterfaces[0].NetworkInterfaceId
-			for _, addr := range ins.NetworkInterfaces[0].Ipv6Addresses {
-				currentIPv6s = append(currentIPv6s, *addr.Ipv6Address)
-			}
-		}
-
-		fmt.Println("================================================================")
-		fmt.Printf(" 实例 ID   : %s\n", *ins.InstanceId)
-		fmt.Printf(" 所在区域  : %s (%s)\n", sel.Region, *ins.Placement.AvailabilityZone)
-		fmt.Printf(" 实例类型  : %s\n", ins.InstanceType)
-		fmt.Printf(" 运行状态  : %s\n", ins.State.Name)
-		fmt.Printf(" 公网 IPv4 : %s\n", sel.PubIP)
-		fmt.Printf(" 内网 IPv4 : %s\n", sel.PrivIP)
-		if len(currentIPv6s) > 0 {
-			fmt.Printf(" IPv6 地址 : %s\n", strings.Join(currentIPv6s, ", "))
-		} else {
-			fmt.Printf(" IPv6 地址 : (未分配)\n")
-		}
-		fmt.Printf(" 启动时间  : %s\n", ins.LaunchTime.Format("2006-01-02 15:04:05"))
-		if ins.KeyName != nil {
-			fmt.Printf(" SSH 密钥  : %s\n", *ins.KeyName)
-		}
-		fmt.Printf(" 磁盘挂载  : %s\n", strings.Join(diskInfo, ", "))
-		fmt.Println("================================================================")
-	}
-
-	fmt.Printf("\n操作: %s\n1) 启动 2) 停止 3) 重启 4) 终止 5) 🔧 网络管理 (IP)\n", sel.ID)
-	switch input("选择: ", "0") {
-	case "1":
-		cli.StartInstances(ctx, &ec2.StartInstancesInput{InstanceIds: []string{sel.ID}})
-		fmt.Println("✅ 启动中")
-	case "2":
-		cli.StopInstances(ctx, &ec2.StopInstancesInput{InstanceIds: []string{sel.ID}})
-		fmt.Println("✅ 停止中")
-	case "3":
-		cli.RebootInstances(ctx, &ec2.RebootInstancesInput{InstanceIds: []string{sel.ID}})
-		fmt.Println("✅ 重启中")
-	case "4":
-		if yes(input("⚠️ 确认终止实例 (删除)? [y/N]: ", "n")) {
-			fmt.Println("🔍 检查关联EIP...")
-			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
-				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
-			})
-			if err == nil && len(eipOut.Addresses) > 0 {
-				for _, addr := range eipOut.Addresses {
-					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: addr.AllocationId})
-					fmt.Printf("   ✅ 已释放 IP: %s\n", *addr.PublicIp)
-				}
-			}
-			cli.TerminateInstances(ctx, &ec2.TerminateInstancesInput{InstanceIds: []string{sel.ID}})
-			fmt.Println("🗑️ 正在终止...")
-		}
-	case "5":
-		if eniID == "" {
-			fmt.Println("❌ 无法找到网络接口 (ENI)，无法操作")
-			return
-		}
-		fmt.Println("\n--- 网络/IP 管理 ---")
-		fmt.Println(" 1) IPv6 管理 (分配/删除)")
-		fmt.Println(" 2) IPv4 公网/弹性IP 管理 (绑定/释放)")
-		netSel := input("选择: ", "0")
-
-		if netSel == "1" {
-			fmt.Printf("当前 IPv6: %v\n", currentIPv6s)
-			fmt.Println(" 1) ➕ 分配新 IPv6")
-			fmt.Println(" 2) ➖ 删除现有 IPv6")
-			sub := input("选择: ", "0")
-			if sub == "1" {
-				_, err := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
-					NetworkInterfaceId: aws.String(eniID),
-					Ipv6AddressCount:   aws.Int32(1),
-				})
-				if err != nil {
-					if strings.Contains(err.Error(), "Subnet does not contain any IPv6 CIDR block ranges") {
-						fmt.Println("\n⚠️  检测到子网未配置 IPv6，正在自动修复 (VPC/子网/路由)...")
-						_, errFix := autoSetupIPv6(ctx, cli, sel.Region, vpcID, subnetID)
-						if errFix != nil {
-							fmt.Printf("❌ 修复失败: %v\n", errFix)
-						} else {
-							fmt.Println("✅ 网络配置已修复，正在重试分配 IP...")
-							time.Sleep(2 * time.Second)
-							_, errRetry := cli.AssignIpv6Addresses(ctx, &ec2.AssignIpv6AddressesInput{
-								NetworkInterfaceId: aws.String(eniID),
-								Ipv6AddressCount:   aws.Int32(1),
-							})
-							if errRetry != nil {
-								fmt.Printf("❌ 重试分配失败: %v\n", errRetry)
-							} else {
-								fmt.Println("✅ 分配成功！(IP 可能需要几秒钟才会显示)")
-							}
-						}
-					} else {
-						fmt.Printf("❌ 分配失败: %v\n", err)
-					}
-				} else {
-					fmt.Println("✅ 分配成功！(IP 可能需要几秒钟才会显示)")
-				}
-			} else if sub == "2" {
-				if len(currentIPv6s) == 0 {
-					fmt.Println("❌ 当前没有 IPv6 地址可删除")
-					return
-				}
-				fmt.Println("请选择要删除的 IP:")
-				for i, ip := range currentIPv6s {
-					fmt.Printf(" %d) %s\n", i+1, ip)
-				}
-				delIdx := mustInt(input("编号: ", "0"))
-				if delIdx > 0 && delIdx <= len(currentIPv6s) {
-					targetIP := currentIPv6s[delIdx-1]
-					_, err := cli.UnassignIpv6Addresses(ctx, &ec2.UnassignIpv6AddressesInput{
-						NetworkInterfaceId: aws.String(eniID),
-						Ipv6Addresses:      []string{targetIP},
-					})
-					if err != nil {
-						fmt.Printf("❌ 删除失败: %v\n", err)
-					} else {
-						fmt.Printf("✅ 已删除: %s\n", targetIP)
-					}
-				}
-			}
-		} else if netSel == "2" {
-			fmt.Println("\n--- 弹性公网 IP (Elastic IP) ---")
-			eipOut, err := cli.DescribeAddresses(ctx, &ec2.DescribeAddressesInput{
-				Filters: []ec2t.Filter{{Name: aws.String("instance-id"), Values: []string{sel.ID}}},
-			})
-			if err != nil {
-				fmt.Println("❌ 查询失败:", err)
-				return
-			}
-			
-			hasEIP := len(eipOut.Addresses) > 0
-			fmt.Printf("当前公网 IP: %s\n", sel.PubIP)
-			if hasEIP {
-				fmt.Println("状态: [✅ 已绑定弹性 IP]")
-				for _, addr := range eipOut.Addresses {
-					fmt.Printf(" - %s (AllocationId: %s)\n", *addr.PublicIp, *addr.AllocationId)
-				}
-			} else {
-				fmt.Println("状态: [⚠️ 动态公网 IP (重启可能会变)]")
-			}
-
-			fmt.Println("\n 1) ➕ 申请并绑定新 EIP (收费/Static)")
-			fmt.Println(" 2) ➖ 解绑并释放 EIP (省费)")
-			
-			sub := input("选择: ", "0")
-			if sub == "1" {
-				if hasEIP {
-					fmt.Println("⚠️ 提示: 该实例已经绑定了弹性 IP。绑定多个可能需要配置辅助网卡。")
-					if !yes(input("继续申请吗? [y/N]: ", "n")) {
-						return
-					}
-				}
-				fmt.Print("⏳ 正在申请 IP...")
-				allocOut, err := cli.AllocateAddress(ctx, &ec2.AllocateAddressInput{Domain: ec2t.DomainTypeVpc})
-				if err != nil {
-					fmt.Println("\n❌ 申请失败:", err)
-					return
-				}
-				newIP := *allocOut.PublicIp
-				allocID := *allocOut.AllocationId
-				fmt.Printf("成功! 获取到: %s\n", newIP)
-
-				fmt.Print("⏳ 正在绑定...")
-				_, err = cli.AssociateAddress(ctx, &ec2.AssociateAddressInput{
-					InstanceId: aws.String(sel.ID),
-					AllocationId: aws.String(allocID),
-				})
-				if err != nil {
-					fmt.Printf("\n❌ 绑定失败: %v\n", err)
-					fmt.Println("   正在回滚 (释放 IP)...")
-					cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{AllocationId: aws.String(allocID)})
-				} else {
-					fmt.Println("\n✅ 绑定成功！现在该实例拥有固定 IP。")
-				}
-
-			} else if sub == "2" {
-				if !hasEIP {
-					fmt.Println("❌ 当前没有绑定弹性 IP，无法释放。")
-					return
-				}
-				target := eipOut.Addresses[0]
-				fmt.Printf("即将释放 IP: %s\n", *target.PublicIp)
-				if yes(input("确认解绑并释放? [y/N]: ", "n")) {
-					if target.AssociationId != nil {
-						_, err := cli.DisassociateAddress(ctx, &ec2.DisassociateAddressInput{
-							AssociationId: target.AssociationId,
-						})
-						if err != nil {
-							fmt.Println("❌ 解绑失败:", err)
-							return
-						}
-						fmt.Println("✅ 已解绑")
-					}
-					_, err := cli.ReleaseAddress(ctx, &ec2.ReleaseAddressInput{
-						AllocationId: target.AllocationId,
-					})
-					if err != nil {
-						fmt.Println("❌ 释放失败 (IP可能仍被保留):", err)
-					} else {
-						fmt.Println("✅ 已释放 (停止计费)")
-					}
-				}
-			}
-		}
-	}
-}
-
 // -------------------- Main --------------------
 
 func main() {
@@ -1675,7 +1743,7 @@ func main() {
 		fmt.Println("\n====== 主菜单 ======")
 		fmt.Println("1) EC2：创建 (自动AMI/IPv6/磁盘)")
 		fmt.Println("2) EC2：管理 (全球扫描)")
-		fmt.Println("3) Lightsail：创建")
+		fmt.Println("3) Lightsail：创建 (支持自定义密钥导入)")
 		fmt.Println("4) Lightsail：管理")
 		fmt.Println("5) 查询配额")
 		fmt.Println("6) 💰 自动完成新手任务 (赚 $80)")
