@@ -1537,7 +1537,8 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 		finalOS = osList[idx-1]
 	}
 
-	openAll := yes(input("\n是否全开防火墙端口 (TCP+UDP 0-65535)? [y/N]: ", "n"))
+	openAll := true
+	fmt.Println("\n✅ 已默认配置全开防火墙端口 (All protocols 0-65535)")
 	ud, _ := collectUserData("\n可选：UserData 脚本")
 
 	fmt.Println("\n🚀 正在提交 Lightsail 创建请求...")
@@ -1584,14 +1585,13 @@ func lsCreate(ctx context.Context, regions []string, creds aws.CredentialsProvid
 			_, err = cli.PutInstancePublicPorts(ctx, &lightsail.PutInstancePublicPortsInput{
 				InstanceName: aws.String(name),
 				PortInfos: []lst.PortInfo{
-					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolTcp},
-					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolUdp},
+					{FromPort: 0, ToPort: 65535, Protocol: lst.NetworkProtocolAll},
 				},
 			})
 			if err != nil {
 				fmt.Printf("❌ 放行端口失败: %v\n", err)
 			} else {
-				fmt.Println("✅ 规则应用成功 (TCP+UDP 0-65535 全放行)")
+				fmt.Println("✅ 规则应用成功 (All protocols 0-65535 全放行)")
 			}
 		} else {
 			fmt.Println("\n⚠️ 实例启动超时，安全组注入未执行，请稍后前往控制台手动修改。")
@@ -1721,11 +1721,36 @@ func main() {
 		fmt.Println("🌐 使用直连模式")
 	}
 
-	ak := input("AWS Access Key ID: ", "")
-	sk := inputSecret("AWS Secret Access Key: ")
+	// --- 修改后的 AK/SK 自动读取逻辑 ---
+	fmt.Println("\n请输入 AWS 凭证 (直接粘贴包含 AK 和 SK 的内容，中间是回车或空格均可):")
+	fmt.Print("> ")
+	
+	r := bufio.NewReader(os.Stdin)
+	
+	// 读取第一行
+	line1, _ := r.ReadString('\n')
+	line1 = strings.TrimSpace(line1)
+	
+	var ak, sk string
+	parts := strings.Fields(line1)
+	
+	if len(parts) >= 2 {
+		// 如果在一行里粘贴了两个（中间有空格），直接提取
+		ak = parts[0]
+		sk = parts[1]
+	} else {
+		// 如果第一行只有一个，说明中间是回车，程序自动静默读取第二行的 SK
+		ak = line1
+		line2, _ := r.ReadString('\n')
+		sk = strings.TrimSpace(line2)
+	}
+
 	if ak == "" || sk == "" {
+		fmt.Println("❌ 凭证读取失败或为空，请重新运行程序并检查输入。")
 		return
 	}
+	// ---------------------------------
+
 	creds := credentials.NewStaticCredentialsProvider(ak, sk, "")
 
 	fmt.Printf("\n🔍 验证凭证...\n")
@@ -1738,6 +1763,8 @@ func main() {
 	fmt.Println("🌍 获取区域列表...")
 	ec2Regions, _ := getEC2RegionsWithStatus(ctx, creds)
 	lsRegions, _ := getLightsailRegions(ctx, creds)
+
+// ... 保持后面的 for 循环主菜单不变 ...
 
 	for {
 		fmt.Println("\n====== 主菜单 ======")
